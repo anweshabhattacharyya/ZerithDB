@@ -35,10 +35,7 @@ export class NameRegistry {
     const existing = this.records.get(record.name);
 
     // Reject conflicting registrations
-    if (
-      existing &&
-      existing.peerId !== record.peerId
-    ) {
+    if (existing && existing.peerId !== record.peerId) {
       return false;
     }
 

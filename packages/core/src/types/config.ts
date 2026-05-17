@@ -69,7 +69,6 @@ export interface NetworkConfig {
 
   /** Optional ENS identity */
   ens?: string;
-
 }
 
 export interface ZerithDBConfig {

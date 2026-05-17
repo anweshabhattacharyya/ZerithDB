@@ -34,8 +34,8 @@ interface SignalingMessage {
   to?: string;
   payload: unknown;
 
-  name?: string;   // human-readable alias (alice.zerith)
-  ens?: string;    // optional ENS name
+  name?: string; // human-readable alias (alice.zerith)
+  ens?: string; // optional ENS name
 }
 
 const DEFAULT_SIGNALING_URL = "wss://arpitkhandelwal810-zerith-signaling.hf.space";
@@ -59,11 +59,7 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   private activeTransportType: "websocket" | "polling" | null = null;
   private readonly peers = new Map<PeerId, SimplePeer.Instance>();
   private readonly peerInfo = new Map<PeerId, PeerInfo>();
-  private readonly peerIdentity = new Map<
-    PeerId,
-    { name?: string; ens?: string }
-  >(); 
-
+  private readonly peerIdentity = new Map<PeerId, { name?: string; ens?: string }>();
 
   private localPeerId: PeerId = crypto.randomUUID();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -83,11 +79,9 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   }
 
   getName(peerId: string) {
-    return this.nameRegistry
-      .entries()
-      .find(r => r.peerId === peerId);
+    return this.nameRegistry.entries().find((r) => r.peerId === peerId);
   }
-  
+
   resolveName(name: string) {
     return this.nameRegistry.resolve(name);
   }
@@ -338,40 +332,40 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
         }
         break;
 
-     case "offer": {
-  if (msg.to === this.localPeerId) {
-    this.createPeer(msg.from, false, msg.payload);
+      case "offer": {
+        if (msg.to === this.localPeerId) {
+          this.createPeer(msg.from, false, msg.payload);
 
-    this.peerIdentity.set(msg.from, {
-      name: msg.name,
-      ens: msg.ens,
-    });
+          this.peerIdentity.set(msg.from, {
+            name: msg.name,
+            ens: msg.ens,
+          });
 
-    let resolvedPeerId = msg.from;
+          let resolvedPeerId = msg.from;
 
-    if (msg.name?.endsWith(".eth")) {
-      const resolved = await this.ensResolver.resolve(msg.name);
-      if (resolved) {
-        resolvedPeerId = resolved;
+          if (msg.name?.endsWith(".eth")) {
+            const resolved = await this.ensResolver.resolve(msg.name);
+            if (resolved) {
+              resolvedPeerId = resolved;
+            }
+          }
+
+          const existing = this.peerInfo.get(msg.from);
+
+          this.peerInfo.set(msg.from, {
+            ...(existing ?? {
+              peerId: msg.from,
+              did: "",
+              publicKey: "",
+              connectedAt: Date.now(),
+            }),
+            name: msg.name ?? existing?.name,
+            ens: msg.ens ?? existing?.ens,
+          });
+        }
+
+        break;
       }
-    }
-
-    const existing = this.peerInfo.get(msg.from);
-
-    this.peerInfo.set(msg.from, {
-      ...(existing ?? {
-        peerId: msg.from,
-        did: "",
-        publicKey: "",
-        connectedAt: Date.now(),
-      }),
-      name: msg.name ?? existing?.name,
-      ens: msg.ens ?? existing?.ens,
-    });
-  }
-
-  break;
-}
 
       case "answer":
         this.peers.get(msg.from)?.signal(msg.payload as any);
@@ -416,16 +410,14 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
           to: remotePeerId,
           payload: data,
 
-	  // Human-readable identity metadata
+          // Human-readable identity metadata
           name:
- 	    this.config.network?.name?.trim() !== ""
-   	      ? this.config.network?.name?.trim()
-   	      : undefined,
+            this.config.network?.name?.trim() !== ""
+              ? this.config.network?.name?.trim()
+              : undefined,
 
-	  ens:
-  	    this.config.network?.ens?.trim() !== ""
-   	      ? this.config.network?.ens?.trim()
-      	      : undefined,
+          ens:
+            this.config.network?.ens?.trim() !== "" ? this.config.network?.ens?.trim() : undefined,
         })
       );
     });
