@@ -1,5 +1,11 @@
 import SimplePeer from "simple-peer";
-import type { ZerithDBConfig, PeerId, PeerInfo } from "zerithdb-core";
+import type {
+  ZerithDBConfig,
+  PeerId,
+  PeerInfo,
+  MediaStreamKind,
+  MediaStreamMetadata,
+} from "zerithdb-core";
 import { EventEmitter, ZerithDBError, ErrorCode } from "zerithdb-core";
 import type { AuthManager } from "zerithdb-auth";
 import type { SignalingTransport } from "./signaling-transport.js";
@@ -24,9 +30,21 @@ type NetworkEvents = {
   "peer:connected": PeerInfo;
   "peer:disconnected": { peerId: PeerId };
   message: { type: string; payload: Uint8Array | string; from: PeerId };
+  "media:stream": { peerId: PeerId; stream: MediaStream; metadata?: MediaStreamMetadata };
+  "media:track": { peerId: PeerId; track: MediaStreamTrack; stream: MediaStream };
+  "media:stream:metadata": { peerId: PeerId; metadata: MediaStreamMetadata };
+  "media:stream:removed": { peerId: PeerId; streamId: string };
   error: { peerId: PeerId; error: Error };
   "transport:downgrade": { from: "websocket"; to: "polling"; reason: string };
 };
+
+export type MediaStreamMetadataInput = Partial<
+  Omit<
+    MediaStreamMetadata,
+    "streamId" | "peerId" | "tracks" | "audioMuted" | "videoMuted" | "updatedAt"
+  >
+> & { kind?: MediaStreamKind };
+
 
 interface SignalingMessage {
   type: "offer" | "answer" | "ice-candidate" | "peer-list";
@@ -60,7 +78,10 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   private readonly peers = new Map<PeerId, SimplePeer.Instance>();
   private readonly peerInfo = new Map<PeerId, PeerInfo>();
   private readonly peerIdentity = new Map<PeerId, { name?: string; ens?: string }>();
-
+  private readonly localStreams = new Map<string, MediaStream>();
+  private readonly localStreamMetadata = new Map<string, MediaStreamMetadata>();
+  private readonly remoteStreams = new Map<PeerId, Map<string, MediaStream>>();
+  private readonly remoteStreamMetadata = new Map<PeerId, Map<string, MediaStreamMetadata>>();
   private localPeerId: PeerId = crypto.randomUUID();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
@@ -85,6 +106,11 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
   resolveName(name: string) {
     return this.nameRegistry.resolve(name);
   }
+
+  get peerId(): PeerId {
+    return this.localPeerId;
+  }
+
 
   /** The transport type currently in use, or null if not connected */
   get transportType(): "websocket" | "polling" | null {
@@ -237,12 +263,17 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     }
     this.peers.clear();
     this.peerInfo.clear();
+    this.localStreams.clear();
+    this.localStreamMetadata.clear();
+    this.remoteStreams.clear();
+    this.remoteStreamMetadata.clear();
     if (this.transport !== null) {
       this.transport.close();
       this.transport = null;
     }
     this.activeTransportType = null;
   }
+
 
   // ─── Private — Transport setup ────────────────────────────────────────────
 
@@ -386,6 +417,7 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
     const peer = new SimplePeer({
       initiator,
       trickle: true,
+      streams: [...this.localStreams.values()],
       config: {
         iceServers: this.config.sync?.iceServers ?? [
           { urls: "stun:stun.l.google.com:19302" },
@@ -435,6 +467,13 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
       };
       this.peerInfo.set(remotePeerId, info);
       this.emit("peer:connected", info);
+
+      for (const [, metadata] of this.localStreamMetadata) {
+        this.sendTo(remotePeerId, {
+          type: "media-stream-metadata",
+          payload: JSON.stringify(metadata),
+        });
+      }
     });
 
     peer.on("data", (data: Uint8Array | string) => {
@@ -442,15 +481,32 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
         const msg = JSON.parse(
           typeof data === "string" ? data : new TextDecoder().decode(data)
         ) as { type: string; payload: string | Uint8Array };
+        this.handlePeerMessage(remotePeerId, msg);
         this.emit("message", { ...msg, from: remotePeerId });
       } catch {
         // Ignore malformed messages
       }
     });
 
+    peer.on("stream", (stream: MediaStream) => {
+      this.rememberRemoteStream(remotePeerId, stream);
+      this.emit("media:stream", {
+        peerId: remotePeerId,
+        stream,
+        metadata: this.remoteStreamMetadata.get(remotePeerId)?.get(stream.id),
+      });
+    });
+
+    peer.on("track", (track: MediaStreamTrack, stream: MediaStream) => {
+      this.rememberRemoteStream(remotePeerId, stream);
+      this.emit("media:track", { peerId: remotePeerId, track, stream });
+    });
+
     peer.on("close", () => {
       this.peers.delete(remotePeerId);
       this.peerInfo.delete(remotePeerId);
+      this.remoteStreams.delete(remotePeerId);
+      this.remoteStreamMetadata.delete(remotePeerId);
       this.emit("peer:disconnected", { peerId: remotePeerId });
     });
 
@@ -458,9 +514,199 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
       this.emit("error", { peerId: remotePeerId, error: err });
       this.peers.delete(remotePeerId);
       this.peerInfo.delete(remotePeerId);
+      this.remoteStreams.delete(remotePeerId);
+      this.remoteStreamMetadata.delete(remotePeerId);
     });
 
     this.peers.set(remotePeerId, peer);
+  }
+
+
+  addMediaStream(
+    stream: MediaStream,
+    metadata: MediaStreamMetadataInput = {}
+  ): MediaStreamMetadata {
+    const normalized = this.buildMediaStreamMetadata(stream, metadata);
+
+    this.localStreams.set(stream.id, stream);
+    this.localStreamMetadata.set(stream.id, normalized);
+
+    for (const [, peer] of this.peers) {
+      peer.addStream(stream);
+    }
+
+    this.broadcastMediaStreamMetadata(normalized);
+    return normalized;
+  }
+
+  /**
+   * Stop publishing a local stream and notify peers that its metadata is gone.
+   */
+  removeMediaStream(streamOrId: MediaStream | string): void {
+    const streamId = typeof streamOrId === "string" ? streamOrId : streamOrId.id;
+    const stream = typeof streamOrId === "string" ? this.localStreams.get(streamId) : streamOrId;
+
+    if (stream !== undefined) {
+      for (const [, peer] of this.peers) {
+        peer.removeStream(stream);
+      }
+    }
+
+    this.localStreams.delete(streamId);
+    this.localStreamMetadata.delete(streamId);
+    this.broadcast({
+      type: "media-stream-removed",
+      payload: JSON.stringify({ streamId }),
+    });
+  }
+
+  /**
+   * Update metadata for an already published local stream.
+   */
+  updateMediaStreamMetadata(
+    streamId: string,
+    metadata: MediaStreamMetadataInput
+  ): MediaStreamMetadata | undefined {
+    const stream = this.localStreams.get(streamId);
+    if (stream === undefined) return undefined;
+
+    const previous = this.localStreamMetadata.get(streamId);
+    const next = this.buildMediaStreamMetadata(stream, {
+      ...previous,
+      ...metadata,
+    });
+
+    this.localStreamMetadata.set(streamId, next);
+    this.broadcastMediaStreamMetadata(next);
+    return next;
+  }
+
+  /**
+   * Enable or disable local audio/video tracks and publish fresh stream metadata.
+   */
+  setMediaTrackEnabled(kind: "audio" | "video", enabled: boolean, streamId?: string): void {
+    const entries =
+      streamId === undefined
+        ? [...this.localStreams.entries()]
+        : [...this.localStreams.entries()].filter(([id]) => id === streamId);
+
+    for (const [id, stream] of entries) {
+      const tracks = kind === "audio" ? stream.getAudioTracks() : stream.getVideoTracks();
+      for (const track of tracks) {
+        track.enabled = enabled;
+      }
+      this.updateMediaStreamMetadata(id, {});
+    }
+  }
+
+  /** Replace a track in every peer connection that receives a local stream. */
+  replaceMediaTrack(
+    streamId: string,
+    oldTrack: MediaStreamTrack,
+    newTrack: MediaStreamTrack
+  ): void {
+    const stream = this.localStreams.get(streamId);
+    if (stream === undefined) return;
+
+    for (const [, peer] of this.peers) {
+      if (peer.connected) {
+        peer.replaceTrack(oldTrack, newTrack, stream);
+      }
+    }
+    this.updateMediaStreamMetadata(streamId, {});
+  }
+
+  /** Snapshot of local streams currently published to the mesh. */
+  getLocalMediaStreams(): MediaStream[] {
+    return [...this.localStreams.values()];
+  }
+
+  /** Snapshot of local stream metadata currently published to the mesh. */
+  getLocalMediaStreamMetadata(streamId?: string): MediaStreamMetadata[] {
+    if (streamId !== undefined) {
+      const metadata = this.localStreamMetadata.get(streamId);
+      return metadata === undefined ? [] : [metadata];
+    }
+    return [...this.localStreamMetadata.values()];
+  }
+
+  /** Snapshot of remote streams received from peers. */
+  getRemoteMediaStreams(peerId?: PeerId): Array<{ peerId: PeerId; stream: MediaStream }> {
+    const result: Array<{ peerId: PeerId; stream: MediaStream }> = [];
+    for (const [remotePeerId, streams] of this.remoteStreams) {
+      if (peerId !== undefined && remotePeerId !== peerId) continue;
+      for (const [, stream] of streams) {
+        result.push({ peerId: remotePeerId, stream });
+      }
+    }
+    return result;
+  }
+
+  private handlePeerMessage(
+    remotePeerId: PeerId,
+    msg: { type: string; payload: string | Uint8Array }
+  ): void {
+    if (msg.type === "media-stream-metadata" && typeof msg.payload === "string") {
+      const metadata = JSON.parse(msg.payload) as MediaStreamMetadata;
+      let peerMetadata = this.remoteStreamMetadata.get(remotePeerId);
+      if (peerMetadata === undefined) {
+        peerMetadata = new Map();
+        this.remoteStreamMetadata.set(remotePeerId, peerMetadata);
+      }
+      peerMetadata.set(metadata.streamId, metadata);
+      this.emit("media:stream:metadata", { peerId: remotePeerId, metadata });
+      return;
+    }
+
+    if (msg.type === "media-stream-removed" && typeof msg.payload === "string") {
+      const payload = JSON.parse(msg.payload) as { streamId: string };
+      this.remoteStreams.get(remotePeerId)?.delete(payload.streamId);
+      this.remoteStreamMetadata.get(remotePeerId)?.delete(payload.streamId);
+      this.emit("media:stream:removed", { peerId: remotePeerId, streamId: payload.streamId });
+    }
+  }
+
+  private rememberRemoteStream(remotePeerId: PeerId, stream: MediaStream): void {
+    let streams = this.remoteStreams.get(remotePeerId);
+    if (streams === undefined) {
+      streams = new Map();
+      this.remoteStreams.set(remotePeerId, streams);
+    }
+    streams.set(stream.id, stream);
+  }
+
+  private broadcastMediaStreamMetadata(metadata: MediaStreamMetadata): void {
+    this.broadcast({
+      type: "media-stream-metadata",
+      payload: JSON.stringify(metadata),
+    });
+  }
+
+  private buildMediaStreamMetadata(
+    stream: MediaStream,
+    metadata: MediaStreamMetadataInput
+  ): MediaStreamMetadata {
+    const tracks = stream.getTracks().map((track) => ({
+      trackId: track.id,
+      kind: track.kind as "audio" | "video",
+      label: track.label,
+      enabled: track.enabled,
+      muted: track.muted,
+      readyState: track.readyState,
+    }));
+
+    const audioTracks = tracks.filter((track) => track.kind === "audio");
+    const videoTracks = tracks.filter((track) => track.kind === "video");
+    return {
+      ...metadata,
+      streamId: stream.id,
+      peerId: this.localPeerId,
+      kind: metadata.kind ?? "camera",
+      audioMuted: audioTracks.length > 0 && audioTracks.every((track) => !track.enabled),
+      videoMuted: videoTracks.length > 0 && videoTracks.every((track) => !track.enabled),
+      tracks,
+      updatedAt: Date.now(),
+    };
   }
 
   private scheduleReconnect(roomId: string): void {
@@ -476,4 +722,5 @@ export class NetworkManager extends EventEmitter<NetworkEvents> {
       void this.connect(roomId);
     }, backoff + jitter);
   }
+
 }

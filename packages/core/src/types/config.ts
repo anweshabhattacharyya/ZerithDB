@@ -33,6 +33,17 @@ export interface SyncConfig {
    * @default "auto"
    */
   transport?: "auto" | "websocket" | "polling";
+
+  /**
+   * Configuration options for low-latency ephemeral sync state.
+   */
+  ephemeral?: EphemeralConfig;
+}
+
+export interface EphemeralConfig {
+  cleanupIntervalMs?: number;
+  throttleMs?: number;
+  staleAfterMs?: number;
 }
 
 export interface AuthConfig {

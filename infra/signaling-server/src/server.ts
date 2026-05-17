@@ -1,8 +1,46 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
+import { verify, type JwtPayload } from "jsonwebtoken";
 
 const PORT = parseInt(process.env["PORT"] ?? "4000", 10);
 const HOST = process.env["HOST"] ?? "0.0.0.0";
+const JWT_SECRET = process.env["JWT_SECRET"] ?? "";
+type LogLevel = "debug" | "info" | "warn" | "error";
+
+const validLogLevels: LogLevel[] = ["debug", "info", "warn", "error"];
+
+const envLogLevel = process.env["LOG_LEVEL"];
+
+const LOG_LEVEL: LogLevel =
+  envLogLevel && validLogLevels.includes(envLogLevel as LogLevel)
+    ? (envLogLevel as LogLevel)
+    : "info";
+const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+const shouldLog = (level: LogLevel): boolean => {
+  return LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[LOG_LEVEL];
+};
+const logger = {
+  debug: (...args: unknown[]) => {
+    if (shouldLog("debug")) console.debug(...args);
+  },
+
+  info: (...args: unknown[]) => {
+    if (shouldLog("info")) console.info(...args);
+  },
+
+  warn: (...args: unknown[]) => {
+    if (shouldLog("warn")) console.warn(...args);
+  },
+
+  error: (...args: unknown[]) => {
+    if (shouldLog("error")) console.error(...args);
+  },
+};
 const SERVER_START_TIME = Date.now();
 
 // ─── Shared room state ──────────────────────────────────────────────────────
@@ -47,6 +85,20 @@ setInterval(() => {
     }
   }
 }, 15_000);
+
+// ─── JWT Auth ───────────────────────────────────────────────────────────────
+
+function verifyRoomToken(token: string | null, roomId: string): string | null {
+  if (!JWT_SECRET) return null;
+  if (!token) return "Missing token";
+  try {
+    const payload = verify(token, JWT_SECRET) as JwtPayload;
+    if (payload["roomId"] !== roomId) return "Token not valid for this room";
+    return null;
+  } catch {
+    return "Invalid or expired token";
+  }
+}
 
 // ─── HTTP server ────────────────────────────────────────────────────────────
 
@@ -122,10 +174,18 @@ wss.on("connection", (ws, req) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   const roomId = url.searchParams.get("room");
   const peerId = url.searchParams.get("peer");
+  const token: string | null = url.searchParams.get("token");
 
   if (!roomId || !peerId) {
-    console.log(`[!] Rejected connection from ${req.socket.remoteAddress}: missing params`);
+    logger.warn(`[!] Rejected connection from ${req.socket.remoteAddress}: missing params`);
     ws.close(1008, "Missing room or peer query parameters");
+    return;
+  }
+
+  const authError = verifyRoomToken(token, roomId);
+  if (authError) {
+    console.log(`[!] Rejected connection from peer=${peerId}: ${authError}`);
+    ws.close(1008, authError);
     return;
   }
 
@@ -139,7 +199,8 @@ wss.on("connection", (ws, req) => {
   const peerEntry: PeerEntry = { peerId, ws };
   room.add(peerEntry);
 
-  console.log(`[+] peer=${peerId} joined room=${roomId} via WebSocket (room size: ${room.size})`);
+  logger.info(`[+] peer=${peerId} joined room=${roomId} (room size: ${room.size})`);
+  logger.info(`[+] peer=${peerId} joined room=${roomId} via WebSocket (room size: ${room.size})`);
 
   // Send the new peer the list of existing peers
   const existingPeerIds = [...room].filter((p) => p.peerId !== peerId).map((p) => p.peerId);
@@ -148,12 +209,16 @@ wss.on("connection", (ws, req) => {
 
   // Relay messages between peers
   ws.on("message", (data) => {
+    logger.debug(
+      `[MESSAGE] peer=${peerId} room=${roomId}`
+    );
     let msg: { to?: string; from?: string; [key: string]: unknown };
     try {
       msg = JSON.parse(data.toString());
     } catch {
-      return; // Ignore malformed messages
-    }
+        logger.warn(`[!] Invalid message from peer=${peerId}`);
+        return;
+      }
 
     // Stamp the sender
     msg.from = peerId;
@@ -163,8 +228,7 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     room.delete(peerEntry);
-    console.log(`[-] peer=${peerId} left room=${roomId} (room size: ${room.size})`);
-
+    logger.info(`[-] peer=${peerId} left room=${roomId} (room size: ${room.size})`);
     // Clean up empty rooms
     if (room.size === 0) {
       rooms.delete(roomId);
@@ -179,7 +243,9 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("error", (err) => {
-    console.error(`[!] peer=${peerId} error:`, err.message);
+    logger.error(
+      `[!] peer=${peerId} error=${err.message}`
+    );
     room.delete(peerEntry);
   });
 });
@@ -202,6 +268,9 @@ function relayMessage(
   const serialized = JSON.stringify(msg);
 
   if (msg.to !== undefined) {
+    // Log unicast messaging details for debugging (Safely handle optional msg.to)
+    logger.debug(`[UNICAST] from=${senderPeerId} to=${msg.to ?? "unknown"}`);
+
     // Unicast to a specific peer
     for (const peer of room) {
       if (peer.peerId === msg.to) {
@@ -210,6 +279,9 @@ function relayMessage(
       }
     }
   } else {
+    // Log broadcast messaging details for debugging
+    logger.debug(`[BROADCAST] from=${senderPeerId} room=${roomId}`);
+
     // Broadcast to all peers except sender
     for (const peer of room) {
       if (peer.peerId !== senderPeerId) {
@@ -260,10 +332,17 @@ function deliverToPeer(peer: PeerEntry, serialized: string): void {
  * Response: { sessionId: string, peerList: string[] }
  */
 function handlePollJoin(req: IncomingMessage, res: ServerResponse): void {
-  readJsonBody(req, (err, body: { room?: string; peer?: string } | null) => {
+  readJsonBody(req, (err, body: { room?: string; peer?: string; token?: string } | null) => {
     if (err || !body?.room || !body?.peer) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Missing room or peer" }));
+      return;
+    }
+
+    const authError = verifyRoomToken(body.token ?? null, body.room);
+    if (authError) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: authError }));
       return;
     }
 
@@ -498,17 +577,17 @@ function readJsonBody(req: IncomingMessage, cb: (err: Error | null, body: any) =
 // ─── Start ──────────────────────────────────────────────────────────────────
 
 server.listen(PORT, HOST, () => {
-  console.log(`🚀 ZerithDB Signaling Server running at ws://${HOST}:${PORT}`);
-  console.log(`   HTTP health check: http://${HOST}:${PORT}`);
-  console.log(`   HTTP long-polling: http://${HOST}:${PORT}/poll/*`);
+  logger.info(`🚀 ZerithDB Signaling Server running at ws://${HOST}:${PORT}`);
+  logger.info(`   HTTP health check: http://${HOST}:${PORT}`);
+  logger.info(`   HTTP long-polling: http://${HOST}:${PORT}/poll/*`);
 });
 
 // Graceful shutdown
 process.on("SIGTERM", () => {
-  console.log("Shutting down signaling server...");
+  logger.info("Shutting down signaling server...");
   // Clean up all polling sessions
   for (const [sessionId] of pollingSessions) {
-    cleanupPollingSession(sessionId);
+  cleanupPollingSession(sessionId);
   }
   wss.close(() => server.close(() => process.exit(0)));
 });
