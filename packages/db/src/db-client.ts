@@ -6,10 +6,39 @@ import type {
   QueryFilter,
   InsertResult,
   UpdateSpec,
+  VectorClock,
 } from "zerithdb-core";
-import { ZerithDBError, ErrorCode } from "zerithdb-core";
+import { ErrorCode } from "zerithdb-core";
 import { wrapIDBOperation } from "./internal/wrap-idb-operation.js";
 import type { BackupExportOptions, BackupSnapshot } from "./backup.js";
+
+type Operation =
+  | {
+      type: "insert";
+      docId: string;
+      doc: any;
+      timestamp: number;
+      vectorClock: VectorClock;
+    }
+  | {
+      type: "update";
+      docIds: string[];
+      before: any[];
+      after: any[];
+      timestamp: number;
+      vectorClock: VectorClock;
+    }
+  | {
+      type: "delete";
+      docIds: string[];
+      before: any[];
+      timestamp: number;
+      vectorClock: VectorClock;
+    };
+
+type PersistedOperation = Operation & {
+  collection: string;
+};
 
 /**
  * A handle to a single named collection within the ZerithDB local database.
@@ -18,7 +47,10 @@ import type { BackupExportOptions, BackupSnapshot } from "./backup.js";
 export class CollectionClient<T extends Record<string, any> = Record<string, any>> {
   constructor(
     private readonly table: Table<Document<T>>,
-    private readonly collectionName: string
+    private readonly collectionName: string,
+    private readonly tick: () => VectorClock,
+    private readonly logOperation: (collection: string, operation: Operation) => Promise<void>,
+    private readonly getOperations: (collection: string) => Operation[]
   ) {}
 
   /**
@@ -56,6 +88,16 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       `Failed to insert into collection "${this.collectionName}"`,
       async () => {
         await this.table.add(doc);
+
+        const vc = this.tick();
+        await this.logOperation(this.collectionName, {
+          type: "insert",
+          docId: id,
+          doc,
+          timestamp: now,
+          vectorClock: vc,
+        });
+
         return { id };
       }
     );
@@ -78,6 +120,17 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       `Failed to bulk insert into collection "${this.collectionName}"`,
       async () => {
         await this.table.bulkAdd(docs);
+        const vc = this.tick();
+
+        for (const doc of docs) {
+          await this.logOperation(this.collectionName, {
+            type: "insert",
+            docId: doc._id,
+            doc,
+            timestamp: now,
+            vectorClock: vc,
+          });
+        }
         return docs.map((d) => ({ id: d._id }));
       }
     );
@@ -125,8 +178,25 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       `Failed to update documents in "${this.collectionName}"`,
       async () => {
         const matches = await this.find(filter);
+
+        const before = matches.map((doc) => ({ ...doc }));
+
         const now = Date.now();
-        await this.table.bulkPut(matches.map((doc) => this.applyUpdateSpec(doc, spec, now)));
+        const vc = this.tick();
+
+        const after = matches.map((doc) => this.applyUpdateSpec(doc, spec, now));
+
+        await this.table.bulkPut(after);
+
+        await this.logOperation(this.collectionName, {
+          type: "update",
+          docIds: matches.map((d) => d._id),
+          before,
+          after,
+          timestamp: now,
+          vectorClock: vc,
+        });
+
         return matches.length;
       }
     );
@@ -142,7 +212,22 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       `Failed to delete documents from "${this.collectionName}"`,
       async () => {
         const matches = await this.find(filter);
-        await this.table.bulkDelete(matches.map((d) => d._id));
+
+        const before = matches.map((doc) => ({ ...doc }));
+        const docIds = matches.map((d) => d._id);
+
+        const now = Date.now();
+        const vc = this.tick();
+
+        await this.table.bulkDelete(docIds);
+
+        await this.logOperation(this.collectionName, {
+          type: "delete",
+          docIds,
+          before,
+          timestamp: now,
+          vectorClock: vc,
+        });
         return matches.length;
       }
     );
@@ -170,6 +255,50 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
   async count(filter: QueryFilter<T> = {}): Promise<number> {
     const docs = await this.find(filter);
     return docs.length;
+  }
+  public async findAtTick(
+    filter: QueryFilter<T>,
+    targetClock: VectorClock
+  ): Promise<Document<T>[]> {
+    const state = new Map<string, Document<T>>();
+
+    const ops = this.getOperations(this.collectionName).slice(-5000);
+    for (const op of ops) {
+      if (!this.happensBefore(op.vectorClock, targetClock)) {
+        continue;
+      }
+
+      if (op.type === "insert") {
+        state.set(op.docId, op.doc);
+      }
+
+      if (op.type === "update") {
+        for (const doc of op.after) {
+          state.set(doc._id, doc);
+        }
+      }
+
+      if (op.type === "delete") {
+        for (const doc of op.before) {
+          state.delete(doc._id);
+        }
+      }
+    }
+
+    return Array.from(state.values()).filter((doc) => this.matchesFilter(doc, filter));
+  }
+
+  private happensBefore(a: VectorClock, b: VectorClock): boolean {
+    for (const key of Object.keys(a)) {
+      const av = a[key] ?? 0;
+      const bv = b[key] ?? Infinity;
+
+      if (av > bv) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   private applyUpdateSpec(doc: Document<T>, spec: UpdateSpec<T>, updatedAt: number): Document<T> {
@@ -250,8 +379,12 @@ class ZerithDBDexie extends Dexie {
    * @returns The Dexie {@link Table} handle for the collection
    */
   ensureCollection(name: string): Table {
+    this._currentSchema.__zerith_ops = "++id, collection, timestamp";
+
     if (!this.tableMap.has(name)) {
-      this._currentSchema[name] = "_id, _createdAt, _updatedAt";
+      if (name !== "__zerith_ops") {
+        this._currentSchema[name] = "_id, _createdAt, _updatedAt";
+      }
 
       // We must increment the version for every new collection added dynamically
       const nextVersion = Math.max(this.verno, this._pendingVersion) + 1;
@@ -278,16 +411,110 @@ export class DbClient {
   private readonly appId: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly collections = new Map<string, CollectionClient<any>>();
+  private operationLog: Operation[] = [];
+  private operationLogByCollection: Map<string, Operation[]> = new Map();
+  private vectorClock: VectorClock = {};
+  private localPeerId: string = "local";
+  private hydrationPromise: Promise<void> = Promise.resolve();
+  private hydrationTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
+
+  private get opsTable(): Table<PersistedOperation> {
+    return this.dexie.table("__zerith_ops");
+  }
+
+  private tick(): VectorClock {
+    const peerId = this.localPeerId;
+
+    this.vectorClock[peerId] = (this.vectorClock[peerId] ?? 0) + 1;
+    return { ...this.vectorClock };
+  }
+
+  private async logOperation(collection: string, operation: Operation): Promise<void> {
+    await this.ensureHydrationStarted();
+
+    this.operationLog.push(operation);
+
+    const collectionOps = this.operationLogByCollection.get(collection) ?? [];
+    collectionOps.push(operation);
+
+    this.operationLogByCollection.set(collection, collectionOps);
+
+    await this.opsTable.add({
+      ...operation,
+      collection,
+    });
+  }
+
+  private async hydrateOperationLog(): Promise<void> {
+    const persisted = await this.opsTable.toArray();
+
+    for (const op of persisted) {
+      const { collection, ...rest } = op;
+
+      this.operationLog.push(rest as Operation);
+
+      const collectionOps = this.operationLogByCollection.get(collection) ?? [];
+      collectionOps.push(rest as Operation);
+
+      this.operationLogByCollection.set(collection, collectionOps);
+    }
+  }
+
+  private ensureHydrationStarted(): Promise<void> {
+    if (this.hydrationTimer) {
+      clearTimeout(this.hydrationTimer);
+      this.hydrationTimer = undefined;
+
+      if (!this.disposed) {
+        this.hydrationPromise = this.hydrateOperationLog();
+        void this.hydrationPromise.catch(() => {});
+      }
+    }
+
+    return this.hydrationPromise;
+  }
+
+  private happensBefore(a: VectorClock, b: VectorClock): boolean {
+    for (const key of Object.keys(a)) {
+      const av = a[key] ?? 0;
+      const bv = b[key] ?? Infinity;
+
+      if (av > bv) {
+        return false;
+      }
+    }
+
+    return true;
+  }
 
   constructor(config: ZerithDBConfig) {
     this.appId = config.appId;
     this.dexie = new ZerithDBDexie(config.appId);
+
+    this.dexie.ensureCollection("__zerith_ops");
+    this.hydrationTimer = setTimeout(() => {
+      if (this.disposed) {
+        return;
+      }
+
+      void this.ensureHydrationStarted();
+    }, 0);
   }
 
   collection<T extends Record<string, any>>(name: string): CollectionClient<T> {
     if (!this.collections.has(name)) {
       const table = this.dexie.ensureCollection(name);
-      this.collections.set(name, new CollectionClient<T>(table as Table<Document<T>>, name));
+      this.collections.set(
+        name,
+        new CollectionClient<T>(
+          table as Table<Document<T>>,
+          name,
+          () => this.tick(),
+          (collection, operation) => this.logOperation(collection, operation),
+          (collection) => this.operationLogByCollection.get(collection) ?? []
+        )
+      );
     }
     return this.collections.get(name) as CollectionClient<T>;
   }
@@ -320,15 +547,15 @@ export class DbClient {
   }
 
   /**
-   * Export all collections to a JSON-serializable snapshot.
-   * If options.collections is omitted, it exports ALL collections found in IndexedDB.
+   * Export collections to a JSON-serializable snapshot.
+   * If options.collections is omitted, it exports collections opened by this DbClient.
    */
   async exportSnapshot(options: BackupExportOptions = {}): Promise<BackupSnapshot> {
     return wrapIDBOperation(
       ErrorCode.DB_READ_FAILED,
       "Failed to export local backup snapshot",
       async () => {
-        const collectionNames = options.collections ?? this.allCollectionNames();
+        const collectionNames = options.collections ?? this.collectionNames();
         const collections: BackupSnapshot["collections"] = {};
 
         for (const name of collectionNames) {
@@ -346,6 +573,43 @@ export class DbClient {
     );
   }
   async dispose(): Promise<void> {
+    this.disposed = true;
+    if (this.hydrationTimer) {
+      clearTimeout(this.hydrationTimer);
+      this.hydrationTimer = undefined;
+    }
+    await this.hydrationPromise.catch(() => {});
     this.dexie.close();
+  }
+
+  public async findAtTick(
+    filter: QueryFilter<any> = {},
+    targetClock: VectorClock = this.vectorClock
+  ): Promise<any[]> {
+    await this.ensureHydrationStarted();
+
+    const state = new Map<string, any>();
+
+    for (const op of this.operationLog) {
+      if (!this.happensBefore(op.vectorClock, targetClock)) continue;
+
+      if (op.type === "insert") {
+        state.set(op.docId, op.doc);
+      }
+
+      if (op.type === "update") {
+        for (const doc of op.after) {
+          state.set(doc._id, doc);
+        }
+      }
+
+      if (op.type === "delete") {
+        for (const doc of op.before) {
+          state.delete(doc._id);
+        }
+      }
+    }
+
+    return Array.from(state.values());
   }
 }

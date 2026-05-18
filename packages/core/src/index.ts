@@ -40,4 +40,4 @@ export type {
   ActiveSpeakerState,
   VideoParticipantState,
 } from "./types/sync.js";
-
+export * from "./types/vector-clock.js";
