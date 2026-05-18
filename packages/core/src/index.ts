@@ -27,6 +27,7 @@ export type {
   PeerInfo,
   RoomId,
   NetworkMessage,
+  VectorClock,
   MediaStreamKind,
   MediaTrackMetadata,
   MediaStreamMetadata,

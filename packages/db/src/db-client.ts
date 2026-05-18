@@ -9,11 +9,40 @@ import type {
   UpdateSpec,
   VectorClock,
 } from "zerithdb-core";
-import { ErrorCode } from "zerithdb-core";
+import { ErrorCode, ZerithDBError } from "zerithdb-core";
 import { wrapIDBOperation } from "./internal/wrap-idb-operation.js";
 import type { BackupExportOptions, BackupSnapshot } from "./backup.js";
 import { GraphClient } from "./graph-client.js";
 import type { GraphNode, GraphEdge } from "zerithdb-core";
+
+type Operation =
+  | {
+      type: "insert";
+      docId: string;
+      doc: any;
+      timestamp: number;
+      vectorClock: VectorClock;
+    }
+  | {
+      type: "update";
+      docIds: string[];
+      before: any[];
+      after: any[];
+      timestamp: number;
+      vectorClock: VectorClock;
+    }
+  | {
+      type: "delete";
+      docIds: string[];
+      before: any[];
+      timestamp: number;
+      vectorClock: VectorClock;
+    };
+
+type PersistedOperation = Operation & {
+  collection: string;
+};
+
 /**
  * A handle to a single named collection within the ZerithDB local database.
  * All operations are async and backed by IndexedDB.
@@ -22,6 +51,9 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
   constructor(
     private readonly table: Table<Document<T>>,
     private readonly collectionName: string,
+    private readonly tick: () => VectorClock,
+    private readonly logOperation: (collection: string, operation: Operation) => Promise<void>,
+    private readonly getOperations: (collection: string) => Operation[],
     private readonly auth?: any
   ) {}
 
@@ -719,7 +751,14 @@ export class DbClient {
       const table = this.dexie.ensureCollection(name);
       this.collections.set(
         name,
-        new CollectionClient<T>(table as Table<Document<T>>, name, this.auth)
+        new CollectionClient<T>(
+          table as Table<Document<T>>,
+          name,
+          () => this.tick(),
+          (collection, operation) => this.logOperation(collection, operation),
+          (collection) => this.operationLogByCollection.get(collection) ?? [],
+          this.auth
+        )
       );
     }
     return this.collections.get(name) as CollectionClient<T>;
