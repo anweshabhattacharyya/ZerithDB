@@ -4,6 +4,9 @@ export type PeerId = string;
 /** Room identifier — formatted as `appId:collectionName` */
 export type RoomId = string;
 
+/** Vector clock used for causal ordering */
+export type VectorClock = Record<string, number>;
+
 /** Information about a connected peer in the mesh network. */
 export interface PeerInfo {
   /** Unique identifier for this peer */
