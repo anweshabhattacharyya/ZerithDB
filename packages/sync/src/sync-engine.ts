@@ -6,8 +6,8 @@ import type { DbClient } from "zerithdb-db";
 import type { NetworkManager } from "zerithdb-network";
 import { InboxQueue } from "./queue/InboxQueue.js";
 import { OutboxQueue } from "./queue/OutboxQueue.js";
-import { bytesToBase64, base64ToBytes } from "zerithdb-utils";
 import { EphemeralStateManager } from "./ephemeral-state.js";
+import { bytesToBase64, base64ToBytes } from "zerithdb-utils";
 
 type SyncEvents = {
   "state:change": SyncState;
@@ -249,6 +249,7 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
 
   private flushUpdates(): void {
     this.syncTimer = null;
+    this.syncTimerIsRaf = false;
     for (const [collectionName, updates] of this.pendingUpdates.entries()) {
       // Y.mergeUpdates merges all updates into a single efficient payload
       const merged = Y.mergeUpdates(updates);

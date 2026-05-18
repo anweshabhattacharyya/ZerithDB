@@ -17,6 +17,7 @@ export type {
   DocumentId,
   CollectionName,
   QueryFilter,
+  QueryOptions,
   UpdateSpec,
   InsertResult,
   FindResult,
@@ -31,6 +32,7 @@ export type {
   MediaStreamMetadata,
 } from "./types/network.js";
 export type { Identity, PublicKey, Signature } from "./types/auth.js";
+
 export type {
   SyncUpdate,
   SyncState,
@@ -40,4 +42,11 @@ export type {
   ActiveSpeakerState,
   VideoParticipantState,
 } from "./types/sync.js";
-export * from "./types/vector-clock.js";
+
+export type {
+  GraphNode,
+  GraphEdge,
+  GraphNodeId,
+  EdgeLabel,
+  GraphTraversalResult,
+} from "./types/graph.js";
