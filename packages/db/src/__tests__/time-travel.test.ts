@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import "fake-indexeddb/auto";
 import { DbClient } from "../db-client.js";
 import type { VectorClock } from "zerithdb-core";
 
